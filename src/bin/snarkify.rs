@@ -1,9 +1,9 @@
 use async_trait::async_trait;
+use clap::Parser;
 use core::time::Duration;
 use reqwest::{header::CONTENT_TYPE, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
-use std::env;
 
 use scroll_proving_sdk::{
     config::{CloudProverConfig, Config},
@@ -21,17 +21,27 @@ use scroll_proving_sdk::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-const SUPPORTED_CIRCUIT_VERSION: &str = "v0.13.1";
+#[derive(Parser, Debug)]
+#[clap(disable_version_flag = true)]
+struct Args {
+    /// Path of config file
+    #[arg(long = "config", default_value = "config.json")]
+    config_file: String,
+    /// Service ID
+    #[arg(long = "service-id")]
+    service_id: String,
+}
 
 #[derive(Deserialize, Debug)]
-pub struct SnarkifyTaskStatusResponse {
+pub struct SnarkifyGetTaskResponse {
     pub task_id: String,
-    pub result: Option<String>,
-    pub state: SnarkifyTaskState,
-    pub input: String,
+    pub created: DateTime<Utc>,
     pub started: Option<DateTime<Utc>>,
     pub finished: Option<DateTime<Utc>>,
-    pub created: DateTime<Utc>,
+    pub state: SnarkifyTaskState,
+    pub input: String,
+    pub proof: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -91,29 +101,18 @@ impl ProvingService for SnarkifyProver {
         false
     }
     async fn get_vk(&self, req: GetVkRequest) -> GetVkResponse {
+        // TODO: Send a request to get the VK
         GetVkResponse {
-            vk: String::new(),
+            vk: "AAAAGQAAAATyWEABRbJ6hQQ5/zLX1gTasr7349minA9rSgMS6gDeHwZKqikRiO3md+pXjjxMHnKQtmXYgMXhJSvlmZ+Ws+cheuly2X1RuNQzcZuRImaKPR9LJsVZYsXfJbuqdKX8p0Gj8G83wMJOmTzNVUyUol0w0lTU+CEiTpHOnxBsTF3EWaW3s1u4ycOgWt1c9M6s7WmaBZLYgAWYCunO5CLCLApNGbCASeck/LuSoedEri5u6HccCKU2khG6zl6W07jvYSbDVLJktbjRiHv+/HQix+K14j8boo8Z/unhpwXCsPxkQA==".to_string(),
             error: None,
         }
     }
     async fn prove(&self, req: ProveRequest) -> ProveResponse {
-        if req.circuit_version != SUPPORTED_CIRCUIT_VERSION {
-            return self.build_prove_error_response(
-                &req,
-                format!(
-                    "Circuit version mismatch: expected {}, got {}",
-                    SUPPORTED_CIRCUIT_VERSION, &req.circuit_version
-                )
-                .as_str(),
-            );
-        }
         let body = SnarkifyCreateTaskRequest::from_prove_request(&req);
         let method = format!("/services/{}", &self.service_id);
 
         match self
-            .post_with_token::<SnarkifyCreateTaskRequest, SnarkifyTaskStatusResponse>(
-                &method, &body,
-            )
+            .post_with_token::<SnarkifyCreateTaskRequest, SnarkifyGetTaskResponse>(&method, &body)
             .await
         {
             Ok(resp) => ProveResponse {
@@ -141,12 +140,19 @@ impl ProvingService for SnarkifyProver {
     async fn query_task(&self, req: QueryTaskRequest) -> QueryTaskResponse {
         let method = format!("/tasks/{}", &req.task_id);
         match self
-            .get_with_token::<SnarkifyTaskStatusResponse>(&method)
+            .get_with_token::<SnarkifyGetTaskResponse>(&method)
             .await
         {
             Ok(resp) => {
-                let task_input: SnarkifyCreateTaskInput =
-                    serde_json::from_str(&resp.input).unwrap();
+                let task_input: SnarkifyCreateTaskInput = match serde_json::from_str(&resp.input) {
+                    Ok(input) => input,
+                    Err(e) => {
+                        return self.build_query_task_error_response(
+                            &req,
+                            &format!("Failed to parse task input: {}", e),
+                        )
+                    }
+                };
                 let started_at = resp.started.map(|t| t.timestamp() as f64);
                 let finished_at = resp.finished.map(|t| t.timestamp() as f64);
                 let compute_time_sec = match (started_at, finished_at) {
@@ -164,32 +170,20 @@ impl ProvingService for SnarkifyProver {
                     finished_at,
                     compute_time_sec,
                     input: Some(task_input.task_data),
-                    proof: None,
+                    proof: resp.proof,
                     vk: None,
-                    error: None,
+                    error: resp.error,
                 }
             }
-            Err(e) => QueryTaskResponse {
-                task_id: req.task_id,
-                circuit_type: CircuitType::Undefined,
-                circuit_version: "".to_string(),
-                hard_fork_name: "".to_string(),
-                status: TaskStatus::Queued,
-                created_at: 0.0,
-                started_at: None,
-                finished_at: None,
-                compute_time_sec: None,
-                input: None,
-                proof: None,
-                vk: None,
-                error: Some(format!("Failed to query proof: {}", e)),
-            },
+            Err(e) => {
+                self.build_query_task_error_response(&req, &format!("Failed to query proof: {}", e))
+            }
         }
     }
 }
 
 impl SnarkifyProver {
-    pub fn new(cfg: CloudProverConfig, api_key: String, service_id: String) -> Self {
+    pub fn new(cfg: CloudProverConfig, service_id: String) -> Self {
         let retry_wait_duration = Duration::from_secs(cfg.retry_wait_time_sec);
         let retry_policy = ExponentialBackoff::builder()
             .retry_bounds(retry_wait_duration / 2, retry_wait_duration)
@@ -201,7 +195,7 @@ impl SnarkifyProver {
 
         Self {
             base_url,
-            api_key,
+            api_key: cfg.api_key,
             service_id,
             send_timeout: Duration::from_secs(cfg.connection_timeout_sec),
             client,
@@ -226,6 +220,28 @@ impl SnarkifyProver {
         }
     }
 
+    pub fn build_query_task_error_response(
+        &self,
+        req: &QueryTaskRequest,
+        error_msg: &str,
+    ) -> QueryTaskResponse {
+        QueryTaskResponse {
+            task_id: req.task_id.clone(),
+            circuit_type: CircuitType::Undefined,
+            circuit_version: "".to_string(),
+            hard_fork_name: "".to_string(),
+            status: TaskStatus::Queued,
+            created_at: 0.0,
+            started_at: None,
+            finished_at: None,
+            compute_time_sec: None,
+            input: None,
+            proof: None,
+            vk: None,
+            error: Some(error_msg.to_string()),
+        }
+    }
+
     fn build_url(&self, method: &str) -> anyhow::Result<Url> {
         self.base_url.join(method).map_err(|e| anyhow::anyhow!(e))
     }
@@ -240,16 +256,15 @@ impl SnarkifyProver {
             .client
             .get(url)
             .header(CONTENT_TYPE, "application/json")
-            .header("X-Api-Key", self.api_key.clone())
+            .header("X-Api-Key", &self.api_key)
             .timeout(self.send_timeout)
             .send()
             .await?;
 
-        if response.status() != http::status::StatusCode::OK {
-            anyhow::bail!(
-                "[Snarkify Client], {method}, status not ok: {}",
-                response.status()
-            )
+        let status = response.status();
+        if !(status >= http::status::StatusCode::OK && status <= http::status::StatusCode::ACCEPTED)
+        {
+            anyhow::bail!("[Snarkify Client], {method}, status not ok: {}", status)
         }
 
         let response_body = response.text().await?;
@@ -272,17 +287,16 @@ impl SnarkifyProver {
             .client
             .post(url)
             .header(CONTENT_TYPE, "application/json")
-            .header("X-Api-Key", self.api_key.clone())
+            .header("X-Api-Key", &self.api_key)
             .body(request_body)
             .timeout(self.send_timeout)
             .send()
             .await?;
 
-        if response.status() != http::status::StatusCode::ACCEPTED {
-            anyhow::bail!(
-                "[Snarkify Client], {method}, status not ok: {}",
-                response.status()
-            )
+        let status = response.status();
+        if !(status >= http::status::StatusCode::OK && status <= http::status::StatusCode::ACCEPTED)
+        {
+            anyhow::bail!("[Snarkify Client], {method}, status not ok: {}", status)
         }
 
         let response_body = response.text().await?;
@@ -297,16 +311,14 @@ impl SnarkifyProver {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let cfg: Config = Config::from_file("config.json".to_string())?;
-    let api_key = env::var("API_KEY").map_err(|_| anyhow::anyhow!("Missing API_KEY"))?;
-    let service_id = env::var("SERVICE_ID").map_err(|_| anyhow::anyhow!("Missing SERVICE_ID"))?;
+    let args = Args::parse();
+    let cfg: Config = Config::from_file(args.config_file)?;
     let cloud_prover = SnarkifyProver::new(
         cfg.prover
             .cloud
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Missing cloud prover configuration"))?,
-        api_key,
-        service_id,
+        args.service_id,
     );
     let prover = ProverBuilder::new(cfg)
         .with_proving_service(Box::new(cloud_prover))
