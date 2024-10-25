@@ -45,6 +45,12 @@ pub struct SnarkifyGetTaskResponse {
 }
 
 #[derive(Deserialize, Debug)]
+pub struct SnarkifyGetVkResponse {
+    pub vk: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum SnarkifyTaskState {
     Pending,
     Success,
@@ -88,7 +94,7 @@ impl SnarkifyCreateTaskRequest {
 }
 
 struct SnarkifyProver {
-    base_url: Url,
+    base_url: String,
     api_key: String,
     service_id: String,
     send_timeout: Duration,
@@ -101,15 +107,25 @@ impl ProvingService for SnarkifyProver {
         false
     }
     async fn get_vk(&self, req: GetVkRequest) -> GetVkResponse {
-        // TODO: Send a request to get the VK
-        GetVkResponse {
-            vk: "AAAAGQAAAATyWEABRbJ6hQQ5/zLX1gTasr7349minA9rSgMS6gDeHwZKqikRiO3md+pXjjxMHnKQtmXYgMXhJSvlmZ+Ws+cheuly2X1RuNQzcZuRImaKPR9LJsVZYsXfJbuqdKX8p0Gj8G83wMJOmTzNVUyUol0w0lTU+CEiTpHOnxBsTF3EWaW3s1u4ycOgWt1c9M6s7WmaBZLYgAWYCunO5CLCLApNGbCASeck/LuSoedEri5u6HccCKU2khG6zl6W07jvYSbDVLJktbjRiHv+/HQix+K14j8boo8Z/unhpwXCsPxkQA==".to_string(),
-            error: None,
+        let method = format!(
+            "/v1/scroll/sdk/vks/versions/{}/types/{}",
+            &req.circuit_version,
+            &req.circuit_type.to_u8()
+        );
+        match self.get_with_token::<SnarkifyGetVkResponse>(&method).await {
+            Ok(resp) => GetVkResponse {
+                vk: resp.vk,
+                error: None,
+            },
+            Err(e) => GetVkResponse {
+                vk: String::new(),
+                error: Some(format!("Failed to get vk: {}", e)),
+            },
         }
     }
     async fn prove(&self, req: ProveRequest) -> ProveResponse {
         let body = SnarkifyCreateTaskRequest::from_prove_request(&req);
-        let method = format!("/services/{}", &self.service_id);
+        let method = format!("/v1/services/{}", &self.service_id);
 
         match self
             .post_with_token::<SnarkifyCreateTaskRequest, SnarkifyGetTaskResponse>(&method, &body)
@@ -138,7 +154,7 @@ impl ProvingService for SnarkifyProver {
     }
 
     async fn query_task(&self, req: QueryTaskRequest) -> QueryTaskResponse {
-        let method = format!("/tasks/{}", &req.task_id);
+        let method = format!("/v1/tasks/{}", &req.task_id);
         match self
             .get_with_token::<SnarkifyGetTaskResponse>(&method)
             .await
@@ -191,10 +207,9 @@ impl SnarkifyProver {
         let client = ClientBuilder::new(reqwest::Client::new())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
-        let base_url = Url::parse(&cfg.base_url).expect("Cannot parse cloud prover base_url");
 
         Self {
-            base_url,
+            base_url: cfg.base_url,
             api_key: cfg.api_key,
             service_id,
             send_timeout: Duration::from_secs(cfg.connection_timeout_sec),
@@ -243,7 +258,8 @@ impl SnarkifyProver {
     }
 
     fn build_url(&self, method: &str) -> anyhow::Result<Url> {
-        self.base_url.join(method).map_err(|e| anyhow::anyhow!(e))
+        let full_url = format!("{}{}", self.base_url, method);
+        Url::parse(&full_url).map_err(|e| anyhow::anyhow!(e))
     }
 
     async fn get_with_token<Resp>(&self, method: &str) -> anyhow::Result<Resp>
