@@ -18,8 +18,23 @@ use scroll_proving_sdk::{
     utils::init_tracing,
 };
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn deserialize_datetime<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // The datetimes from the Snarkify API does not provide timezone information,
+    // so we assume it is UTC.
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    s.map(|s| {
+        NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S")
+            .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+            .map_err(serde::de::Error::custom)
+    })
+    .transpose()
+}
 
 #[derive(Parser, Debug)]
 #[clap(disable_version_flag = true)]
@@ -35,8 +50,11 @@ struct Args {
 #[derive(Deserialize, Debug)]
 pub struct SnarkifyGetTaskResponse {
     pub task_id: String,
-    pub created: DateTime<Utc>,
+    #[serde(deserialize_with = "deserialize_datetime")]
+    pub created: Option<DateTime<Utc>>,
+    #[serde(deserialize_with = "deserialize_datetime")]
     pub started: Option<DateTime<Utc>>,
+    #[serde(deserialize_with = "deserialize_datetime")]
     pub finished: Option<DateTime<Utc>>,
     pub state: SnarkifyTaskState,
     pub input: String,
@@ -137,7 +155,7 @@ impl ProvingService for SnarkifyProver {
                 circuit_version: req.circuit_version,
                 hard_fork_name: req.hard_fork_name,
                 status: resp.state.into(),
-                created_at: resp.created.timestamp() as f64,
+                created_at: resp.created.map(|t| t.timestamp() as f64).unwrap_or(0.0),
                 started_at: resp.started.map(|t| t.timestamp() as f64),
                 finished_at: None,
                 compute_time_sec: None,
@@ -181,7 +199,7 @@ impl ProvingService for SnarkifyProver {
                     circuit_version: task_input.circuit_version,
                     hard_fork_name: task_input.hard_fork_name,
                     status: resp.state.into(),
-                    created_at: resp.created.timestamp() as f64,
+                    created_at: resp.created.map(|t| t.timestamp() as f64).unwrap_or(0.0),
                     started_at,
                     finished_at,
                     compute_time_sec,
