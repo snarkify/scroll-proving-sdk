@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use clap::Parser;
 use core::time::Duration;
+use log::error;
 use reqwest::{header::CONTENT_TYPE, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
-
 use scroll_proving_sdk::{
     config::{CloudProverConfig, Config},
     prover::{
@@ -20,6 +20,9 @@ use scroll_proving_sdk::{
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
+
+/// API version used by the Snarkify platform.
+const API_VERSION: &'static str = "v1";
 
 fn deserialize_datetime<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
 where
@@ -39,16 +42,18 @@ where
 #[derive(Parser, Debug)]
 #[clap(disable_version_flag = true)]
 struct Args {
-    /// Path of config file
+    /// Path to the configuration file in JSON format.
+    /// Please refer to config.json in https://github.com/snarkify/scroll-proving-sdk
     #[arg(long = "config", default_value = "config.json")]
     config_file: String,
-    /// Service ID
+    /// Unique UUID for the service in Snarkify platform.
     #[arg(long = "service-id")]
     service_id: String,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct SnarkifyGetTaskResponse {
+    /// Task UUID in Snarkify platform.
     pub task_id: String,
     #[serde(deserialize_with = "deserialize_datetime")]
     pub created: Option<DateTime<Utc>>,
@@ -57,13 +62,18 @@ pub struct SnarkifyGetTaskResponse {
     #[serde(deserialize_with = "deserialize_datetime")]
     pub finished: Option<DateTime<Utc>>,
     pub state: SnarkifyTaskState,
+    /// Task input data necessary for the proof generation.
     pub input: String,
+    /// Task proof.
     pub proof: Option<String>,
+    /// Task error message.
     pub error: Option<String>,
+    pub proof_type: Option<SnarkifyProofType>,
 }
 
 #[derive(Deserialize, Debug)]
 pub struct SnarkifyGetVkResponse {
+    /// Verifying key.
     pub vk: String,
 }
 
@@ -76,11 +86,30 @@ pub enum SnarkifyTaskState {
 }
 
 impl From<SnarkifyTaskState> for TaskStatus {
-    fn from(status: SnarkifyTaskState) -> Self {
-        match status {
+    fn from(state: SnarkifyTaskState) -> Self {
+        match state {
             SnarkifyTaskState::Pending => TaskStatus::Proving,
             SnarkifyTaskState::Success => TaskStatus::Success,
             SnarkifyTaskState::Failure => TaskStatus::Failed,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SnarkifyProofType {
+    Chunk,
+    Batch,
+    Bundle,
+}
+
+impl From<CircuitType> for SnarkifyProofType {
+    fn from(circuit_type: CircuitType) -> Self {
+        match circuit_type {
+            CircuitType::Chunk => SnarkifyProofType::Chunk,
+            CircuitType::Batch => SnarkifyProofType::Batch,
+            CircuitType::Bundle => SnarkifyProofType::Bundle,
+            CircuitType::Undefined => unreachable!("CircuitType::Undefined should not be used"),
         }
     }
 }
@@ -96,6 +125,7 @@ pub struct SnarkifyCreateTaskInput {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SnarkifyCreateTaskRequest {
     pub input: SnarkifyCreateTaskInput,
+    pub proof_type: SnarkifyProofType,
 }
 
 impl SnarkifyCreateTaskRequest {
@@ -107,6 +137,7 @@ impl SnarkifyCreateTaskRequest {
                 hard_fork_name: request.hard_fork_name.clone(),
                 task_data: request.input.clone(),
             },
+            proof_type: request.circuit_type.into(),
         }
     }
 }
@@ -126,7 +157,8 @@ impl ProvingService for SnarkifyProver {
     }
     async fn get_vk(&self, req: GetVkRequest) -> GetVkResponse {
         let method = format!(
-            "/v1/scroll/sdk/vks/versions/{}/types/{}",
+            "/{}/scroll/sdk/vks/versions/{}/types/{}",
+            API_VERSION,
             &req.circuit_version,
             &req.circuit_type.to_u8()
         );
@@ -135,15 +167,18 @@ impl ProvingService for SnarkifyProver {
                 vk: resp.vk,
                 error: None,
             },
-            Err(e) => GetVkResponse {
-                vk: String::new(),
-                error: Some(format!("Failed to get vk: {}", e)),
-            },
+            Err(e) => {
+                error!("get_vk method failed: {:?}", e);
+                GetVkResponse {
+                    vk: String::new(),
+                    error: Some(format!("Failed to get vk: {}", e)),
+                }
+            }
         }
     }
     async fn prove(&self, req: ProveRequest) -> ProveResponse {
         let body = SnarkifyCreateTaskRequest::from_prove_request(&req);
-        let method = format!("/v1/services/{}", &self.service_id);
+        let method = format!("/{}/services/{}", API_VERSION, &self.service_id);
 
         match self
             .post_with_token::<SnarkifyCreateTaskRequest, SnarkifyGetTaskResponse>(&method, &body)
@@ -165,14 +200,14 @@ impl ProvingService for SnarkifyProver {
                 error: None,
             },
             Err(e) => {
-                return self
-                    .build_prove_error_response(&req, &format!("Failed to request proof: {}", e))
+                error!("prove method failed: {:?}", e);
+                self.build_prove_error_response(&req, &format!("Failed to request proof: {}", e))
             }
         }
     }
 
     async fn query_task(&self, req: QueryTaskRequest) -> QueryTaskResponse {
-        let method = format!("/v1/tasks/{}", &req.task_id);
+        let method = format!("/{}/tasks/{}", API_VERSION, &req.task_id);
         match self
             .get_with_token::<SnarkifyGetTaskResponse>(&method)
             .await
@@ -210,6 +245,7 @@ impl ProvingService for SnarkifyProver {
                 }
             }
             Err(e) => {
+                error!("query_task method failed: {:?}", e);
                 self.build_query_task_error_response(&req, &format!("Failed to query proof: {}", e))
             }
         }
