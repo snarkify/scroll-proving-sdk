@@ -8,7 +8,7 @@ WORKDIR /usr/src/app
 COPY . .
 
 # Build the project
-RUN cargo build --release --example cloud
+RUN cargo build --bin snarkify --release
 
 # Create a new stage with a minimal Ubuntu image
 FROM ubuntu:20.04
@@ -17,7 +17,7 @@ FROM ubuntu:20.04
 RUN apt-get update && apt-get install -y libssl-dev && rm -rf /var/lib/apt/lists/*
 
 # Copy the built binary from the builder stage
-COPY --from=builder /usr/src/app/target/release/examples/cloud /usr/local/bin/cloud
+COPY --from=builder /usr/src/app/target/release/snarkify /usr/local/bin/snarkify
 
 # Set the entrypoint
-ENTRYPOINT ["cloud"]
+ENTRYPOINT ["snarkify"]

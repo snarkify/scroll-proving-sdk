@@ -3,7 +3,7 @@ use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 const SDK_VERSION: &str = "v0.0.1";
 
 pub fn get_version(circuit_version: &str) -> String {
-    format!("{}-{}", SDK_VERSION, circuit_version)
+    "v4.4.56-bce3383-6f7b46a-e5ddf67".to_string()
 }
 
 pub fn init_tracing() {
